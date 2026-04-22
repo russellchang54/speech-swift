@@ -61,10 +61,10 @@ public enum HuggingFaceDownloader {
     // MARK: - Weight Existence Check
 
     /// Extensions recognised as cached model weights: the canonical
-    /// HF `.safetensors` layout plus Apple CoreML bundle directories
-    /// (`.mlmodelc`, `.mlpackage`) shipped by CoreML-only repos.
+    /// HF `.safetensors` layout, Apple CoreML bundle directories
+    /// (`.mlmodelc`, `.mlpackage`), and numpy weight files (`.npy`).
     public static let weightFileExtensions: Set<String> = [
-        "safetensors", "mlmodelc", "mlpackage"
+        "safetensors", "mlmodelc", "mlpackage", "npy"
     ]
 
     /// Returns `true` when `directory` contains at least one entry
@@ -336,6 +336,14 @@ public enum HuggingFaceDownloader {
         offlineMode: Bool = false,
         progressHandler: ((Double) -> Void)? = nil
     ) async throws {
+        // Check if weights already exist - skip download if they do
+        if weightsExist(in: directory) {
+            AudioLog.download.debug("Weights already exist in \(directory.path), skipping download")
+            progressHandler?(1.0)
+            return
+        }
+
+        // Check environment variable for source selection
         let useModelScope = ProcessInfo.processInfo.environment["QWEN3_MODEL_SOURCE"] == "modelscope"
 
         if useModelScope {
@@ -357,7 +365,6 @@ public enum HuggingFaceDownloader {
                 progressHandler: progressHandler
             )
         }
-    }
     }
 
     // MARK: - Security Helpers (kept for backward compat + security tests)
