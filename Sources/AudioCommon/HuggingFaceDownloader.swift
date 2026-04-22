@@ -85,10 +85,10 @@ public enum HuggingFaceDownloader {
     // MARK: - Weight Existence Check
 
     /// Extensions recognised as cached model weights: the canonical
-    /// HF `.safetensors` layout plus Apple CoreML bundle directories
-    /// (`.mlmodelc`, `.mlpackage`) shipped by CoreML-only repos.
+    /// HF `.safetensors` layout, Apple CoreML bundle directories
+    /// (`.mlmodelc`, `.mlpackage`), and numpy weight files (`.npy`).
     public static let weightFileExtensions: Set<String> = [
-        "safetensors", "mlmodelc", "mlpackage"
+        "safetensors", "mlmodelc", "mlpackage", "npy"
     ]
 
     /// Returns `true` when `directory` contains at least one entry
@@ -652,14 +652,31 @@ public enum HuggingFaceDownloader {
 
     // MARK: - Unified Download with Source Selection
 
-    /// Download model files with automatic source selection based on environment
+    /// Download model files with automatic source selection based on environment.
+    ///
+    /// Pass `requiredFiles` for bundles that need more than weight files to be
+    /// usable. `weightsExist` only inspects weight-like extensions, so a cache
+    /// holding `.safetensors` but missing `config.json` would otherwise look
+    /// complete and be skipped, leaving the model unloadable.
     public static func downloadWeightsWithSourceSelection(
         modelId: String,
         to directory: URL,
         additionalFiles: [String] = [],
         offlineMode: Bool = false,
+        requiredFiles: [String] = [],
         progressHandler: ((Double) -> Void)? = nil
     ) async throws {
+        // Check if weights already exist - skip download if they do
+        let hasRequiredFiles = requiredFiles.allSatisfy {
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
+        }
+        if weightsExist(in: directory) && hasRequiredFiles {
+            AudioLog.download.debug("Weights already exist in \(directory.path), skipping download")
+            progressHandler?(1.0)
+            return
+        }
+
+        // Check environment variable for source selection
         let useModelScope = ProcessInfo.processInfo.environment["QWEN3_MODEL_SOURCE"] == "modelscope"
 
         if useModelScope {
@@ -681,7 +698,6 @@ public enum HuggingFaceDownloader {
                 progressHandler: progressHandler
             )
         }
-    }
     }
 
     // MARK: - Security Helpers (kept for backward compat + security tests)

@@ -84,8 +84,7 @@ public final class SortformerDiarizer {
 
         let cacheDir = try cacheDir ?? HuggingFaceDownloader.getCacheDirectory(for: modelId)
 
-        let modelFileName = config.coreMLModelFileName
-        try await HuggingFaceDownloader.downloadWeights(
+        try await HuggingFaceDownloader.downloadWeightsWithSourceSelection(
             modelId: modelId,
             to: cacheDir,
             additionalFiles: ["\(modelFileName)/**", "config.json"],
