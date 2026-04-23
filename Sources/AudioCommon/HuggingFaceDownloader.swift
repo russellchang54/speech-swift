@@ -51,7 +51,8 @@ public enum HuggingFaceDownloader {
 
     // MARK: - Weight Existence Check
 
-    /// Check if safetensors weights exist in a directory.
+    /// Check if model weights exist in a directory.
+    /// Supports multiple formats: safetensors, mlmodelc, npy
     public static func weightsExist(in directory: URL) -> Bool {
         let fm = FileManager.default
         guard fm.fileExists(atPath: directory.path) else { return false }
@@ -62,7 +63,18 @@ public enum HuggingFaceDownloader {
             AudioLog.download.debug("Could not list directory \(directory.path): \(error)")
             contents = []
         }
-        return contents.contains { $0.pathExtension == "safetensors" }
+
+        // Check for various weight formats
+        return contents.contains { url in
+            let ext = url.pathExtension
+            // MLX models use safetensors
+            if ext == "safetensors" { return true }
+            // CoreML models use .mlmodelc (directory)
+            if ext == "mlmodelc" { return true }
+            // Numpy weight files
+            if ext == "npy" { return true }
+            return false
+        }
     }
 
     // MARK: - Download
@@ -127,6 +139,47 @@ public enum HuggingFaceDownloader {
         throw DownloadError.failedToDownload("\(modelId): \(lastError?.localizedDescription ?? "unknown")")
     }
 
+    // MARK: - Unified Download with Source Selection
+
+    /// Download model files with automatic source selection based on environment
+    public static func downloadWeightsWithSourceSelection(
+        modelId: String,
+        to directory: URL,
+        additionalFiles: [String] = [],
+        offlineMode: Bool = false,
+        progressHandler: ((Double) -> Void)? = nil
+    ) async throws {
+        // Check if weights already exist - skip download if they do
+        if weightsExist(in: directory) {
+            AudioLog.download.debug("Weights already exist in \(directory.path), skipping download")
+            progressHandler?(1.0)
+            return
+        }
+
+        // Check environment variable for source selection
+        let useModelScope = ProcessInfo.processInfo.environment["QWEN3_MODEL_SOURCE"] == "modelscope"
+
+        if useModelScope {
+            AudioLog.download.debug("Using ModelScope to download \(modelId)")
+            try await ModelScopeDownloader.downloadWeights(
+                modelId: modelId,
+                to: directory,
+                additionalFiles: additionalFiles,
+                offlineMode: offlineMode,
+                progressHandler: progressHandler
+            )
+        } else {
+            AudioLog.download.debug("Using HuggingFace to download \(modelId)")
+            try await downloadWeights(
+                modelId: modelId,
+                to: directory,
+                additionalFiles: additionalFiles,
+                offlineMode: offlineMode,
+                progressHandler: progressHandler
+            )
+        }
+    }
+
     // MARK: - Security Helpers (kept for backward compat + security tests)
 
     /// Convert an arbitrary modelId into a single, safe path component for on-disk caching.
@@ -185,15 +238,18 @@ public enum HuggingFaceDownloader {
         let root: URL
         if let override = ProcessInfo.processInfo.environment["QWEN3_CACHE_DIR"],
            !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // Use the override directly without appending cacheDirName
             root = URL(fileURLWithPath: override, isDirectory: true)
+            return root
         } else if let override = ProcessInfo.processInfo.environment["QWEN3_ASR_CACHE_DIR"],
                   !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            // Legacy env var support
+            // Legacy env var support - use directly
             root = URL(fileURLWithPath: override, isDirectory: true)
+            return root
         } else {
             root = fm.urls(for: .cachesDirectory, in: .userDomainMask).first!
+            return root.appendingPathComponent(cacheDirName, isDirectory: true)
         }
-        return root.appendingPathComponent(cacheDirName, isDirectory: true)
     }
 
     /// Create a `HubApi` whose `downloadBase` is derived from the repo directory that
