@@ -1,0 +1,58 @@
+name: Daily Sync
+
+# Fetches latest from upstream/main, rebases custom onto it, builds, and pushes.
+on:
+  schedule:
+    - cron: '37 8 * * *'   # 08:37 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: daily-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: custom
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up upstream
+        run: |
+          git remote add upstream https://github.com/soniqo/speech-swift.git
+          git fetch upstream main
+
+      - name: Update main from upstream
+        run: |
+          git checkout main
+          git reset --hard upstream/main
+          git push origin main --force-with-lease || true
+
+      - name: Rebase custom onto main
+        run: |
+          git checkout custom
+          git rebase main
+
+      - name: Cache SPM dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-custom-${{ runner.os }}-${{ hashFiles('Package.swift') }}
+          restore-keys: spm-custom-${{ runner.os }}-
+
+      - name: Build
+        run: make build
+
+      - name: Push custom
+        run: git push --force-with-lease origin custom
