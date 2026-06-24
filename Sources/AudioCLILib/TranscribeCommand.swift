@@ -147,6 +147,8 @@ public struct TranscribeCommand: ParsableCommand {
     }
 
     /// Build the effective context string, combining `--context` and `--proper-nouns`.
+    /// Uses an explicit instruction to prevent the model from regurgitating the
+    /// reference list into the transcript.
     private func resolveContext() -> String? {
         let nouns = resolveProperNouns()
         var parts = [String]()
@@ -154,8 +156,9 @@ public struct TranscribeCommand: ParsableCommand {
             parts.append(ctx)
         }
         if !nouns.isEmpty {
+            // Compact list with explicit do-not-output instruction
             let nounList = nouns.joined(separator: "、")
-            parts.append("重要专有名词：\(nounList)")
+            parts.append("以下术语仅作识别参考，请勿输出：\(nounList)")
         }
         return parts.isEmpty ? nil : parts.joined(separator: "；")
     }
@@ -288,20 +291,37 @@ public struct TranscribeCommand: ParsableCommand {
         return result
     }
 
-    /// Strip echoed context prefix from the transcription result.
+    /// Strip echoed context from the transcription result.
+    ///
+    /// Two-layer defence:
+    /// 1. Strip leading sentences that contain 3+ proper nouns (echo at start).
+    /// 2. If the remaining text is still dominated by proper nouns and looks
+    ///    like a list (contains 、or ？separators), treat it as pure
+    ///    hallucination and return empty.
     private func stripContextEcho(_ text: String) -> String {
         var remaining = text
         let nouns = resolveProperNouns()
-        while let period = remaining.firstIndex(of: "。") {
-            let prefix = String(remaining[..<period])
+        let delimiters: [Character] = ["。", "？", "！", "；"]
+
+        // Layer 1: strip leading sentences that are context echo
+        while let boundary = delimiters.compactMap({ remaining.firstIndex(of: $0) }).min() {
+            let prefix = String(remaining[..<boundary])
             let matchCount = nouns.filter { prefix.contains($0) }.count
             if matchCount >= 3 {
-                let after = remaining.index(after: period)
+                let after = remaining.index(after: boundary)
                 remaining = String(remaining[after...]).trimmingCharacters(in: .whitespaces)
             } else {
                 break
             }
         }
+
+        // Layer 2: pure hallucination check — high noun density + list pattern
+        let totalMatchCount = nouns.filter({ remaining.contains($0) }).count
+        let looksLikeList = remaining.contains("、") || remaining.contains("？")
+        if totalMatchCount >= 5 && looksLikeList {
+            return ""
+        }
+
         return remaining
     }
 
