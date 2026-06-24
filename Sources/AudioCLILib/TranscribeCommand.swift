@@ -247,6 +247,8 @@ public struct TranscribeCommand: ParsableCommand {
     private static let homophoneCorrections: [String: String] = [
         "这里办": "浙里办",
         "这会办": "浙里办",
+        "治理办": "浙里办",
+        "哲里办": "浙里办",
         "惠信": "汇信",
         "会信": "汇信",
         "回信": "汇信",
