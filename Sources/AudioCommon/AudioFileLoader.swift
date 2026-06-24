@@ -24,6 +24,10 @@ public enum AudioFileLoader {
     /// `quality` selects the SRC filter when resampling (default `.standard`;
     /// pass `.mastering` for music/upsampling).
     public static func load(url: URL, targetSampleRate: Int = 24000, quality: ResampleQuality = .standard) throws -> [Float] {
+        // Auto-detect non-PCM codecs (G.723.1 etc.) and fall back to ffmpeg
+        if needsFFmpegDecoding(url: url) {
+            return try loadWithFFmpeg(url: url, targetSampleRate: targetSampleRate)
+        }
         let audioFile = try AVAudioFile(forReading: url)
         let format = audioFile.processingFormat
         let frameCount = AVAudioFrameCount(audioFile.length)
@@ -359,6 +363,112 @@ public enum AudioFileLoader {
         }
         return out
     }
+
+    // MARK: - FFmpeg Bridge (telephony codec support)
+
+    /// Locate ffmpeg binary, searching Homebrew paths then PATH.
+    private static let ffmpegPath: String = {
+        let candidates = [
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+        ]
+        for path in candidates {
+            if FileManager.default.isExecutableFile(atPath: path) { return path }
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["which", "ffmpeg"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+        if process.terminationStatus == 0 {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let path = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !path.isEmpty {
+                return path
+            }
+        }
+        return "/opt/homebrew/bin/ffmpeg"
+    }()
+
+    /// Read the WAV format tag (audio codec ID) from a WAV file header.
+    /// Returns nil if not a valid RIFF/WAVE file.
+    /// Format tag 1 = PCM, 0x0042 = G.723.1, etc.
+    public static func readWAVFormatTag(url: URL) -> UInt16? {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+              data.count >= 24 else { return nil }
+
+        guard String(data: data[0..<4], encoding: .ascii) == "RIFF",
+              String(data: data[8..<12], encoding: .ascii) == "WAVE" else {
+            return nil
+        }
+
+        var offset = 12
+        while offset + 8 <= data.count {
+            let chunkId = String(data: data[offset..<(offset+4)], encoding: .ascii)
+            let chunkSize = data[(offset+4)..<(offset+8)].withUnsafeBytes {
+                $0.loadUnaligned(as: UInt32.self)
+            }
+            if chunkId == "fmt " {
+                guard offset + 10 <= data.count else { return nil }
+                return data[(offset+8)..<(offset+10)].withUnsafeBytes {
+                    $0.loadUnaligned(as: UInt16.self)
+                }
+            }
+            offset += 8 + Int(chunkSize)
+        }
+        return nil
+    }
+
+    /// Returns true if the WAV file uses a non-PCM codec that AVFoundation cannot decode.
+    public static func needsFFmpegDecoding(url: URL) -> Bool {
+        guard let tag = readWAVFormatTag(url: url) else { return false }
+        return tag != 1
+    }
+
+    /// Decode audio using ffmpeg, returning PCM Float32 samples at the target sample rate.
+    /// Spawns `ffmpeg -i <url> -f f32le -ar <rate> -ac 1 pipe:1` and reads f32le from stdout.
+    public static func loadWithFFmpeg(url: URL, targetSampleRate: Int) throws -> [Float] {
+        print("  Detected non-PCM codec, decoding via ffmpeg...")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: ffmpegPath)
+        process.arguments = [
+            "-loglevel", "error",
+            "-i", url.path,
+            "-f", "f32le",
+            "-ar", "\(targetSampleRate)",
+            "-ac", "1",
+            "pipe:1",
+        ]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+
+        try process.run()
+        let rawData = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            throw AudioLoadError.ffmpegFailed(
+                "ffmpeg exited with code \(process.terminationStatus). Install with: brew install ffmpeg")
+        }
+
+        let count = rawData.count / MemoryLayout<Float>.size
+        guard count > 0 else {
+            throw AudioLoadError.ffmpegFailed("ffmpeg produced no audio data")
+        }
+
+        return rawData.withUnsafeBytes { ptr in
+            guard let base = ptr.bindMemory(to: Float.self).baseAddress else {
+                return []
+            }
+            return Array(UnsafeBufferPointer(start: base, count: count))
+        }
+    }
 }
 
 public enum AudioLoadError: Error, LocalizedError {
@@ -366,6 +476,7 @@ public enum AudioLoadError: Error, LocalizedError {
     case noFloatData
     case invalidWAVFile
     case unsupportedFormat(String)
+    case ffmpegFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -377,6 +488,8 @@ public enum AudioLoadError: Error, LocalizedError {
             return "Invalid WAV file format"
         case .unsupportedFormat(let reason):
             return "Unsupported audio format: \(reason)"
+        case .ffmpegFailed(let reason):
+            return "ffmpeg decoding failed: \(reason)"
         }
     }
 }

@@ -3,7 +3,7 @@ import AudioCommon
 
 /// Shared helpers for diarization post-processing, used by both
 /// PyannoteDiarizationPipeline and SortformerDiarizer.
-enum DiarizationHelpers {
+public enum DiarizationHelpers {
 
     /// Merge adjacent segments from the same speaker when the gap is below `minSilence`.
     ///
@@ -179,5 +179,100 @@ enum DiarizationHelpers {
         let denom = sqrt(normA) * sqrt(normB)
         guard denom > 1e-10 else { return 2.0 }
         return 1.0 - dot / denom
+    }
+
+    // MARK: - Phone Call Diarization
+
+    /// Post-process a diarization result to have exactly 2 speakers.
+    ///
+    /// - If `numSpeakers == 2`: returned unchanged.
+    /// - If `numSpeakers < 2`: returned unchanged.
+    /// - If `numSpeakers > 2`: keeps top 2 speakers by total speech duration,
+    ///   reassigns remaining speakers' segments to the closest primary speaker
+    ///   (by centroid cosine distance when embeddings are available, otherwise
+    ///   to the top-1 speaker).
+    public static func enforceTwoSpeakers(_ result: DiarizationResult) -> DiarizationResult {
+        guard result.numSpeakers > 2, !result.segments.isEmpty else {
+            return result
+        }
+
+        // Map speaker ID to total speech duration
+        var speakerDurations = [Int: Float]()
+        for seg in result.segments {
+            speakerDurations[seg.speakerId, default: 0] += seg.duration
+        }
+
+        let sortedSpeakers = speakerDurations.keys.sorted {
+            speakerDurations[$0]! > speakerDurations[$1]!
+        }
+
+        let primarySpeakers = Array(sortedSpeakers.prefix(2))
+        let otherSpeakers = sortedSpeakers.dropFirst(2)
+
+        // Build speaker → primary mapping for non-primary speakers
+        var speakerMap = [Int: Int]()
+        for spk in primarySpeakers { speakerMap[spk] = spk }
+
+        let hasEmbeddings = result.speakerEmbeddings.count == result.numSpeakers
+
+        for spk in otherSpeakers {
+            if hasEmbeddings, spk < result.speakerEmbeddings.count {
+                let emb = result.speakerEmbeddings[spk]
+                var bestPrimary = primarySpeakers[0]
+                var bestDist: Float = 2.0
+                for p in primarySpeakers where p < result.speakerEmbeddings.count {
+                    let d = cosineDistance(emb, result.speakerEmbeddings[p])
+                    if d < bestDist { bestDist = d; bestPrimary = p }
+                }
+                speakerMap[spk] = bestPrimary
+            } else {
+                speakerMap[spk] = primarySpeakers[0]
+            }
+        }
+
+        // Remap segments, compacting IDs to 0 and 1
+        let primaryToNew = [primarySpeakers[0]: 0, primarySpeakers[1]: 1]
+        var newSegments = [DiarizedSegment]()
+        for seg in result.segments {
+            let mappedSpeaker = speakerMap[seg.speakerId] ?? seg.speakerId
+            let newId = primaryToNew[mappedSpeaker] ?? mappedSpeaker
+            newSegments.append(DiarizedSegment(
+                startTime: seg.startTime, endTime: seg.endTime, speakerId: newId))
+        }
+
+        let merged = mergeSegments(newSegments, minSilence: 0)
+        let compacted = compactSpeakerIds(merged)
+
+        // Build centroids for the 2 new speakers from the remapped embeddings
+        var newCentroids = [[Float]](repeating: [], count: 2)
+        if hasEmbeddings {
+            for (i, p) in primarySpeakers.enumerated() where p < result.speakerEmbeddings.count {
+                newCentroids[i] = result.speakerEmbeddings[p]
+            }
+        }
+
+        return DiarizationResult(
+            segments: compacted,
+            numSpeakers: 2,
+            speakerEmbeddings: newCentroids
+        )
+    }
+
+    /// Compute agent/customer labels for a 2-speaker diarization result.
+    /// The speaker with more total speech duration is labeled "agent",
+    /// the other "customer".
+    public static func computePhoneCallLabels(_ segments: [DiarizedSegment]) -> [Int: String] {
+        var durations = [Int: Float]()
+        for seg in segments {
+            durations[seg.speakerId, default: 0] += seg.duration
+        }
+
+        let sorted = durations.keys.sorted { durations[$0]! > durations[$1]! }
+        if sorted.count >= 2 {
+            return [sorted[0]: "agent", sorted[1]: "customer"]
+        } else if let first = sorted.first {
+            return [first: "agent"]
+        }
+        return [:]
     }
 }

@@ -48,13 +48,15 @@ public struct DiarizeCommand: ParsableCommand {
     @Option(name: .long, help: "Cosine distance threshold for speaker clustering (default 0.715, lower = fewer speakers)")
     public var clusterThreshold: Float = 0.715
 
+    @Flag(name: .long, help: "Optimize for 1:1 phone call recordings (2 speakers, agent/customer labeling)")
+    public var phoneCall: Bool = false
+
     public init() {}
 
     public func run() throws {
         try runAsync {
             print("Loading audio: \(audioFile)")
-            let audio = try AudioFileLoader.load(
-                url: URL(fileURLWithPath: audioFile), targetSampleRate: 16000)
+            let audio = try loadAudio()
             let duration = formatDuration(audio.count, sampleRate: 16000)
             print("  Loaded \(audio.count) samples (\(duration)s)")
 
@@ -74,6 +76,11 @@ public struct DiarizeCommand: ParsableCommand {
                 print("Error: unknown engine '\(engine)'. Use 'pyannote' or 'sortformer'.")
             }
         }
+    }
+
+    private func loadAudio() throws -> [Float] {
+        let url = URL(fileURLWithPath: audioFile)
+        return try AudioFileLoader.load(url: url, targetSampleRate: 16000)
     }
 
     #if canImport(CoreML)
@@ -119,10 +126,12 @@ public struct DiarizeCommand: ParsableCommand {
         let result = diarizer.diarize(audio: audio, sampleRate: 16000, config: config)
         let elapsed = Date().timeIntervalSince(start)
 
-        outputResult(result, elapsed: elapsed)
+        let finalResult = phoneCall
+            ? DiarizationHelpers.enforceTwoSpeakers(result) : result
+        outputResult(finalResult, elapsed: elapsed)
 
         if let refFile = scoreAgainst {
-            try scoreDER(result: result, refFile: refFile)
+            try scoreDER(result: finalResult, refFile: refFile)
         }
     }
     #endif
@@ -181,7 +190,9 @@ public struct DiarizeCommand: ParsableCommand {
                 audio: audio, sampleRate: 16000, config: config)
             let elapsed = Date().timeIntervalSince(start)
 
-            outputResult(result, elapsed: elapsed)
+            let finalResult = phoneCall
+                ? DiarizationHelpers.enforceTwoSpeakers(result) : result
+            outputResult(finalResult, elapsed: elapsed)
 
             if let refFile = scoreAgainst {
                 try scoreDER(result: result, refFile: refFile)
@@ -190,6 +201,10 @@ public struct DiarizeCommand: ParsableCommand {
     }
 
     private func outputResult(_ result: DiarizationResult, elapsed: TimeInterval) {
+        if phoneCall {
+            outputPhoneCallResult(result, elapsed: elapsed)
+            return
+        }
         if rttm {
             let basename = URL(fileURLWithPath: audioFile).deletingPathExtension().lastPathComponent
             let rttmSegments = toRTTM(segments: result.segments, filename: basename)
@@ -256,6 +271,66 @@ public struct DiarizeCommand: ParsableCommand {
             ])
         }
         if let data = try? JSONSerialization.data(withJSONObject: items, options: .prettyPrinted),
+           let str = String(data: data, encoding: .utf8) {
+            print(str)
+        }
+    }
+
+    // MARK: - Phone Call Output
+
+    private func outputPhoneCallResult(_ result: DiarizationResult, elapsed: TimeInterval) {
+        let labels = DiarizationHelpers.computePhoneCallLabels(result.segments)
+
+        if rttm {
+            let basename = URL(fileURLWithPath: audioFile).deletingPathExtension().lastPathComponent
+            let rttmSegments = toRTTM(segments: result.segments, filename: basename)
+            var labeledSegments = rttmSegments
+            for (i, seg) in result.segments.enumerated() where i < labeledSegments.count {
+                let label = labels[seg.speakerId] ?? "speaker_\(seg.speakerId)"
+                labeledSegments[i] = RTTMSegment(
+                    filename: labeledSegments[i].filename,
+                    startTime: labeledSegments[i].startTime,
+                    duration: labeledSegments[i].duration,
+                    speakerLabel: label
+                )
+            }
+            print(formatRTTM(labeledSegments))
+        } else if json {
+            printPhoneCallJSON(result, labels: labels)
+        } else {
+            if result.segments.isEmpty {
+                print("No speech detected.")
+            } else {
+                for seg in result.segments {
+                    let s = String(format: "%.2f", seg.startTime)
+                    let e = String(format: "%.2f", seg.endTime)
+                    let d = String(format: "%.2f", seg.duration)
+                    let label = labels[seg.speakerId] ?? "speaker_\(seg.speakerId)"
+                    print("\(label): [\(s)s - \(e)s] (\(d)s)")
+                }
+                print("\n--- 2 speakers (agent, customer) ---")
+            }
+            print("Diarization took \(String(format: "%.2f", elapsed))s")
+        }
+    }
+
+    private func printPhoneCallJSON(_ result: DiarizationResult, labels: [Int: String]) {
+        var items = [[String: Any]]()
+        for seg in result.segments {
+            items.append([
+                "start": Double(String(format: "%.3f", seg.startTime))!,
+                "end": Double(String(format: "%.3f", seg.endTime))!,
+                "duration": Double(String(format: "%.3f", seg.duration))!,
+                "speaker": seg.speakerId,
+                "label": labels[seg.speakerId] ?? "speaker_\(seg.speakerId)",
+            ])
+        }
+        let output: [String: Any] = [
+            "segments": items,
+            "num_speakers": result.numSpeakers,
+            "phone_call": true,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: output, options: .prettyPrinted),
            let str = String(data: data, encoding: .utf8) {
             print(str)
         }

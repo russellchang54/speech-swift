@@ -117,6 +117,63 @@ Qwen3-ASR operates in batch mode only. The entire audio input is processed in a 
 
 For long-form audio (> 15 s) and real-time transcription use cases, use [`StreamingASR.transcribeStream(...)`](https://github.com/soniqo/speech-swift/blob/main/Sources/Qwen3ASR/StreamingASR.swift) — it VAD-segments the input at silence boundaries with a `maxSegmentDuration` force-split safety net (default 10 s), so each segment hits the greedy fast path instead of the slow-path escalation that batch `transcribe(...)` engages on inputs over `longInputThresholdSeconds` (default 15 s). Streaming also avoids the per-segment encoder peak that long batch inputs incur on memory-constrained devices.
 
+## Proper Noun Enhancement
+
+Qwen3-ASR supports proper noun biasing via context injection into the chat-style system prompt (`<|im_start|>system\n{context}<|im_end|>`). This improves recognition of domain-specific terms like company names, product names, and government platforms.
+
+### Built-in Government/Business Proper Nouns
+
+A set of 34 Chinese government and business terms is injected automatically on every transcription — no flags required:
+
+**e照通, 浙里办, 汇信, 汇信CA, e签宝, 天谷, 企微, 浙政钉, 市监, 浙江政务服务网, 市场监督局, CA证书, 联连APP, 联连用户, 联连客户端, 公示系统, 工商年报, 天眼查, 企查查, 企业登记, 电子营业执照, 即时申报, 经营异常修复, 经营异常移出, 信用修复, 浙江企业在线, 政采云, 乐采云, 政务网, 简易注销, 备案, 无违规证明, 汇信移动CA, 天谷CA**
+
+### Custom Proper Nouns (`--proper-nouns`)
+
+Add extra terms on top of the built-in list:
+
+```bash
+speech transcribe call.wav --proper-nouns "自定义词,额外词"
+speech transcribe call.wav --proper-nouns terms.txt   # one term per line
+```
+
+### Homophone Correction
+
+After transcription, a post-processing pass corrects known ASR homophone errors using a built-in mapping of common mistakes → correct form. Examples:
+
+| ASR Output | Corrected |
+|-----------|-----------|
+| 这里办 | 浙里办 |
+| 会信 | 汇信 |
+| 天眼茶 | 天眼查 |
+| 正采云 | 政采云 |
+| 浙江政府网 | 浙江政务服务网 |
+
+Corrections are applied automatically to both `transcribe` and `transcribe --phone-call` output.
+
+## Phone Call Transcription (`--phone-call`)
+
+Combines diarization and transcription in one pass for 1:1 customer service recordings:
+
+```bash
+speech transcribe call.wav --phone-call
+speech transcribe call.wav --phone-call --json
+```
+
+**Pipeline**:
+1. Diarize with 2-speaker enforcement → agent/customer labels
+2. Transcribe each speaker segment individually
+3. Apply proper noun context + homophone correction to each segment
+4. Output labeled transcript with timestamps
+
+```
+customer [4.6s]: 哎，你好，我就是想问一下...
+agent [8.1s]: 好。
+customer [10.0s]: 就是有一个，不是叫浙里办，这个他自己好像因为验证码搜不到...
+agent [19.9s]: 哦，好的，请问一下，怎么称呼您？
+```
+
+G.723.1 telephony codec (8000 Hz) is auto-detected and decoded via ffmpeg — no manual conversion needed.
+
 ## Language Detection
 
 The model automatically detects the spoken language from the audio content. No language hint or locale parameter is required. The text decoder emits a language token at the start of generation, followed by the transcribed text. Supported languages include English, Chinese, Japanese, Korean, and many European languages.

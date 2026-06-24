@@ -113,6 +113,14 @@ for seg in result.segments {
     print("Speaker \(seg.speakerId): [\(seg.startTime)s - \(seg.endTime)s]")
 }
 print("\(result.numSpeakers) speakers detected")
+
+// Phone call: enforce 2 speakers with agent/customer labels
+let twoSpeaker = DiarizationHelpers.enforceTwoSpeakers(result)
+let labels = DiarizationHelpers.computePhoneCallLabels(twoSpeaker.segments)
+for seg in twoSpeaker.segments {
+    let label = labels[seg.speakerId] ?? "unknown"
+    print("\(label): [\(seg.startTime)s - \(seg.endTime)s]")
+}
 ```
 
 #### Progress Reporting & Cancellation
@@ -205,6 +213,28 @@ speech diarize meeting.wav --target-speaker enrollment.wav
 # Embed a speaker's voice
 speech embed-speaker enrollment.wav
 speech embed-speaker enrollment.wav --engine coreml --json
+
+# Phone call diarization (1:1 customer service calls)
+speech diarize call.wav --phone-call
+speech diarize call.wav --phone-call --json
+```
+
+### Phone Call Mode (`--phone-call`)
+
+Optimizes diarization for 1:1 phone recordings (customer + agent):
+
+- **Two-speaker enforcement**: Post-processes the diarization result to exactly 2 speakers. If the pipeline produces more than 2, the top 2 by speech duration are kept and remaining speakers are merged into the closest primary speaker (by cosine distance when embeddings are available).
+- **Auto-labeling**: The speaker with more total speech duration is labeled `agent`, the other `customer`.
+- **G.723.1 auto-decode**: `AudioFileLoader.load()` automatically detects non-PCM WAV codecs (e.g. G.723.1 at 8000 Hz) and decodes via ffmpeg if available. No manual conversion needed.
+- **Output**: Text, JSON, or RTTM with `agent`/`customer` labels instead of numeric speaker IDs.
+
+```
+$ speech diarize call.wav --phone-call
+agent: [0.00s - 4.52s] (4.52s)
+customer: [4.60s - 7.50s] (2.90s)
+agent: [8.14s - 9.41s] (1.27s)
+...
+--- 2 speakers (agent, customer) ---
 ```
 
 ## Model Weights

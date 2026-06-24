@@ -89,6 +89,23 @@ let model = try await ParakeetASRModel.fromPretrained(
 
 Ship pre-downloaded models in your app bundle, point `cacheDir` at them, and set `offlineMode: true` to guarantee zero network calls.
 
+## Telephony Codec Support (G.723.1, etc.)
+
+`AudioFileLoader.load()` automatically detects non-PCM WAV codecs (e.g. G.723.1 at 8000 Hz) by reading the WAV format tag. When detected, it falls back to ffmpeg for decoding, producing 16kHz PCM Float32 output transparently.
+
+```bash
+brew install ffmpeg   # one-time setup, not bundled with the package
+```
+
+No manual conversion needed — just pass the file as usual:
+
+```bash
+speech transcribe call_recording.wav
+speech diarize call_recording.wav --phone-call
+```
+
+Supported telephony codecs (any codec ffmpeg can decode): G.723.1, G.711 μ-law/A-law, G.729, GSM, and others. Standard PCM WAV, FLAC, and MP3 files are unaffected and continue to use AVFoundation's native decoder.
+
 ## ModelScope Support
 
 Models can be downloaded from ModelScope (modelscope.cn) instead of HuggingFace by setting the environment variable:
