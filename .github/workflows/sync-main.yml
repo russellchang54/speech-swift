@@ -1,0 +1,77 @@
+name: Sync main with upstream
+
+# Keeps this fork's `main` an exact mirror of soniqo/speech-swift:main.
+#
+# `main` carries no local commits of its own, so upstream is always a single
+# fast-forward away: merge-upstream reports `merge_type: fast-forward` and no
+# merge commits ever accumulate. That is the whole reason this file lives on
+# `custom` instead of on `main` -- see below.
+#
+# Why `custom`: GitHub only schedules workflows that are present on the
+# repository's default branch, and the default branch here is `custom`. Putting
+# this file on `main` would make `main` diverge from upstream by exactly this
+# commit, and every later sync would have to create a merge commit because a
+# diverged branch can no longer fast-forward.
+
+on:
+  schedule:
+    # 08:23 UTC (16:23 Beijing). Deliberately off the hour -- GitHub queues the
+    # :00 and :30 marks and runs them late.
+    - cron: '23 8 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Fast-forward main from upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # gh exits non-zero on any non-2xx. Success is 200 with a merge_type
+          # of fast-forward (advanced), none (already current) or merge (only
+          # possible if main somehow gained a local commit).
+          if ! body=$(gh api \
+                        --method POST \
+                        "repos/${GITHUB_REPOSITORY}/merge-upstream" \
+                        --input - <<< '{"branch":"main"}' 2>&1); then
+            echo "::error::merge-upstream rejected the sync. Usual causes: 409 (main is"
+            echo "::error::no longer fast-forwardable, i.e. someone committed to it) or"
+            echo "::error::403 (GITHUB_TOKEN lacks contents:write on this fork). Body:"
+            echo "$body"
+            exit 1
+          fi
+
+          merge_type=$(jq -r '.merge_type // "unknown"' <<< "$body")
+          echo "merge_type: $merge_type"
+
+          case "$merge_type" in
+            fast-forward) echo "::notice::main advanced to upstream";;
+            none)         echo "::notice::main already matches upstream";;
+            merge)
+              echo "::warning::a merge commit was created, so main had diverged from"
+              echo "::warning::upstream. main is supposed to be a pure mirror -- check"
+              echo "::warning::for a stray local commit."
+              ;;
+            *)            echo "::warning::unexpected merge_type. Body: $body";;
+          esac
+
+# If this schedule ever goes quiet, it is almost certainly state
+# `disabled_inactivity`: GitHub silently disables scheduled workflows after 60
+# days without repository activity, and the state does NOT clear on its own.
+# Check and recover with:
+#   gh api repos/russellchang54/speech-swift/actions/workflows \
+#     --jq '.workflows[] | select(.name=="Sync main with upstream") | {id,state}'
+#   gh api --method PUT \
+#     repos/russellchang54/speech-swift/actions/workflows/<id>/enable
