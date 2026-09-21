@@ -305,6 +305,16 @@ public let MODEL_REGISTRY: [ModelVariant] = [
           modelId: SortformerDiarizer.defaultModelId,
           aliases: ["sortformer", "sortformer-diarization"],
           kind: .diarize),
+    .init(name: "pyannote-diarization",
+          engine: "pyannote",
+          modelId: "pyannote/speaker-diarization-3.1",
+          aliases: ["pyannote-diarize"],
+          kind: .diarize),
+    .init(name: "community1-diarization-coreml",
+          engine: "community1",
+          modelId: Community1DiarizationPipeline.defaultModelId,
+          aliases: ["community1", "community-1", "community1-diarize"],
+          kind: .diarize),
 
     // ─── Speaker embedding ─────────────────────────────────────────────────
     .init(name: "wespeaker-resnet34-lm-mlx",

@@ -187,7 +187,7 @@ func openAIErrorResponse(
         body: .init(byteBuffer: .init(data: data)))
 }
 
-private func parseBoundary(_ contentType: String) -> String? {
+func parseBoundary(_ contentType: String) -> String? {
     // Content-Type: multipart/form-data; boundary=----WebKitFormBoundary...
     for part in contentType.split(separator: ";") {
         let trimmed = part.trimmingCharacters(in: .whitespaces)

@@ -333,6 +333,97 @@ public struct AudioServer {
                 body: .init(byteBuffer: .init(data: wavData)))
         }
 
+        router.post("/diarize") { request, _ in
+            // 16 kHz mono PCM_16 tops out around 55 MB for a 28-minute call;
+            // cap above that so the longest recordings fit in one request.
+            let body = try await request.body.collect(upTo: 64 * 1024 * 1024)
+            let contentType = request.headers[.contentType] ?? ""
+
+            // Multipart/form-data (the shape OpenAI-style and batch clients
+            // post), or JSON / raw-WAV via the shared RequestParams parser.
+            let audioData: Data
+            let fields: [String: String]
+            if contentType.contains("multipart/form-data") {
+                guard let boundary = parseBoundary(contentType) else {
+                    return errorResponse("Missing multipart boundary", status: .badRequest)
+                }
+                var parsed: [String: String] = [:]
+                var file: Data?
+                for part in MultipartParser.parse(Data(buffer: body), boundary: boundary) {
+                    guard let name = part.name else { continue }
+                    if name == "file" || name == "audio" {
+                        file = part.body
+                    } else {
+                        parsed[name] = part.stringValue
+                    }
+                }
+                guard let file, !file.isEmpty else {
+                    return errorResponse("Missing audio data", status: .badRequest)
+                }
+                audioData = file
+                fields = parsed
+            } else {
+                let params = try RequestParams.parse(body, contentType: contentType)
+                guard let data = params.audioData else {
+                    return errorResponse("Missing audio data", status: .badRequest)
+                }
+                audioData = data
+                fields = params.fields
+            }
+
+            let engineName = (fields["engine"] ?? "pyannote").lowercased()
+            guard ["pyannote", "community1", "sortformer"].contains(engineName) else {
+                return errorResponse(
+                    "Unknown diarization engine: \(engineName). Use pyannote, community1, or sortformer.",
+                    status: .badRequest)
+            }
+
+            // Variant precedence: model > engine default. Same pattern as the
+            // other registry-driven routes — typos return 400 with a specific
+            // message rather than silently using the default.
+            if let modelName = fields["model"], !modelName.isEmpty {
+                guard let v = resolveModelVariant(modelName),
+                      v.kind == .diarize, v.engine == engineName else {
+                    return errorResponse(
+                        "Unknown diarization model for engine '\(engineName)': \(modelName)",
+                        status: .badRequest)
+                }
+            }
+
+            let audio: [Float]
+            do {
+                audio = try decodeWAVData(audioData, targetSampleRate: 16000)
+            } catch {
+                return errorResponse(
+                    "Could not decode audio: \(error.localizedDescription)",
+                    status: .badRequest)
+            }
+
+            // Speaker-count bounds are a Community-1 clustering constraint
+            // only — the pyannote and sortformer pipelines take no speaker
+            // count input, mirroring the CLI where --num-speakers is
+            // documented as Community-1-only.
+            let numSpeakers = fields["num_speakers"].flatMap(Int.init)
+                ?? fields["numSpeakers"].flatMap(Int.init)
+
+            let result: DiarizationResult
+            switch engineName {
+            case "community1":
+                let pipeline = try await state.loadCommunity1Diarizer()
+                let bounds = numSpeakers.map { Community1SpeakerBounds(exact: $0) } ?? .inferred
+                result = try pipeline.diarize(
+                    audio: audio, sampleRate: 16000, speakerBounds: bounds)
+            case "sortformer":
+                let diarizer = try await state.loadSortformerDiarizer()
+                result = diarizer.diarize(audio: audio, sampleRate: 16000)
+            default:  // "pyannote"
+                let pipeline = try await state.loadPyannoteDiarizer()
+                result = pipeline.diarize(audio: audio, sampleRate: 16000)
+            }
+
+            return jsonArrayResponse(diarizeSegmentsJSON(result.segments))
+        }
+
         return router
     }
 }
@@ -699,6 +790,36 @@ final class ModelState: RealtimeModelLoading, @unchecked Sendable {
     /// Back-compat shim — default DeepFilterNet3 bundle.
     func loadEnhancer() async throws -> SpeechEnhancer {
         try await loadEnhancer(modelId: SpeechEnhancer.defaultModelId)
+    }
+
+    private var pyannoteDiarizer: DiarizationPipeline?
+
+    func loadPyannoteDiarizer() async throws -> DiarizationPipeline {
+        if let m = pyannoteDiarizer { return m }
+        print("[server] Loading pyannote diarization pipeline...")
+        let m = try await DiarizationPipeline.fromPretrained(progressHandler: logProgress)
+        pyannoteDiarizer = m
+        return m
+    }
+
+    private var community1Diarizer: Community1DiarizationPipeline?
+
+    func loadCommunity1Diarizer() async throws -> Community1DiarizationPipeline {
+        if let m = community1Diarizer { return m }
+        print("[server] Loading Community-1 diarization pipeline...")
+        let m = try await Community1DiarizationPipeline.fromPretrained(progressHandler: logProgress)
+        community1Diarizer = m
+        return m
+    }
+
+    private var sortformerDiarizer: SortformerDiarizer?
+
+    func loadSortformerDiarizer() async throws -> SortformerDiarizer {
+        if let m = sortformerDiarizer { return m }
+        print("[server] Loading Sortformer diarizer...")
+        let m = try await SortformerDiarizer.fromPretrained(progressHandler: logProgress)
+        sortformerDiarizer = m
+        return m
     }
 }
 
@@ -1911,6 +2032,29 @@ func errorResponse(_ message: String, status: HTTPResponse.Status) -> Response {
         status: status,
         headers: [.contentType: "application/json"],
         body: .init(byteBuffer: .init(data: data)))
+}
+
+func jsonArrayResponse(_ array: [[String: Any]]) -> Response {
+    let data = (try? JSONSerialization.data(
+        withJSONObject: array, options: [.sortedKeys])) ?? Data()
+    return Response(
+        status: .ok,
+        headers: [.contentType: "application/json"],
+        body: .init(byteBuffer: .init(data: data)))
+}
+
+/// Map diarization segments onto the wire contract consumed by HTTP
+/// clients: `[{"startTime": s, "endTime": s, "speakerId": n}, ...]`.
+/// Times are seconds rounded to millisecond precision, matching the CLI's
+/// printed precision.
+func diarizeSegmentsJSON(_ segments: [DiarizedSegment]) -> [[String: Any]] {
+    segments.map { seg in
+        [
+            "startTime": Double(round(Double(seg.startTime) * 1000) / 1000),
+            "endTime": Double(round(Double(seg.endTime) * 1000) / 1000),
+            "speakerId": seg.speakerId,
+        ]
+    }
 }
 
 // MARK: - PCM Conversion
